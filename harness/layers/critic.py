@@ -73,22 +73,72 @@ from __future__ import annotations
 from harness.middleware import Middleware
 
 
+#: Liên từ dùng để ghép hai nửa câu của hai tài liệu mâu thuẫn.
+_JOIN = " và "
+
+#: Câu trả lời khi không còn claim nào trụ lại được.
+_ABSTAIN_ANSWER = "Không đủ căn cứ trong tài liệu đã đọc để trả lời câu hỏi này."
+
+
 class Critic(Middleware):
     """Xoá những gì bằng chứng không đỡ; abstain khi không còn gì."""
 
     name = "critic"
 
+    def _doc_id_for(self, ctx, text: str) -> str | None:
+        """Tài liệu nào trong corpus thực sự chứa đoạn `text` này?"""
+        corpus = ctx.corpus
+        if corpus is None:
+            return None
+        for doc in corpus.docs:
+            if text in doc.body:
+                return doc.doc_id
+        return None
+
+    def _split_merged(self, ctx, text: str):
+        """Thử tách một câu bị ghép từ hai tài liệu khác nhau bằng " và "."""
+        start = 0
+        while True:
+            pos = text.find(_JOIN, start)
+            if pos == -1:
+                return None
+            left, right = text[:pos], text[pos + len(_JOIN):]
+            if ctx.saw(left) and ctx.saw(right):
+                left_doc = self._doc_id_for(ctx, left)
+                right_doc = self._doc_id_for(ctx, right)
+                if left_doc and right_doc and left_doc != right_doc:
+                    return [{"text": left, "doc_id": left_doc}, {"text": right, "doc_id": right_doc}]
+            start = pos + 1
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        kept: list[dict] = []
+        found_contradiction = False
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                continue
+            text = claim["text"]
+            if ctx.saw(text):
+                kept.append(claim)
+                continue
+            halves = self._split_merged(ctx, text)
+            if halves:
+                kept.extend(halves)
+                found_contradiction = True
+            # else: không có bằng chứng nào đỡ -> bịa, bỏ claim này đi.
+
+        if not kept:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = _ABSTAIN_ANSWER
+            return report
+
+        if found_contradiction:
+            report["abstain"] = True
+        report["claims"] = kept
+        report["citations"] = sorted({c["doc_id"] for c in kept if c.get("doc_id")})
+        return report
